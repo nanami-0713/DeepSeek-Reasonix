@@ -1,0 +1,232 @@
+# One-off internal test packages from one immutable main-v2 commit.
+# No tags, releases, update manifests, or public download pointers are changed.
+name: QA v1.38.12-1 packages
+run-name: QA v1.38.12-1 Windows x64 and macOS Universal
+
+on:
+  push:
+    branches: [test/qa-v1.38.12-1-packages]
+    paths: [.github/workflows/qa-v1.38.12-1-packages.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-v1.38.12-1-packages
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 438566dd6c9b39eaf0d49027576e57e7f610d0dc
+  TEST_VERSION: v1.38.12-1
+
+jobs:
+  windows-x64:
+    name: Build and accept Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify immutable source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain)"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: desktop/go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            desktop/go.sum
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          version: 10
+          run_install: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - name: Install NSIS
+        shell: pwsh
+        run: ./scripts/install-nsis.ps1
+      - name: Build Windows x64 installer
+        run: scripts/desktop-build.sh windows/amd64 "$TEST_VERSION" canary
+      - name: Verify bundle and native shell handshake
+        run: |
+          node desktop/packaging/verify.mjs dist/Reasonix-windows-amd64.zip
+          node desktop/packaging/smoke.mjs desktop/build/electron/windows-amd64/app \
+            --service desktop/build/bin/reasonix-desktop.exe --timeout 90
+      - name: Accept final installer on disposable runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go -C desktop build -o "$env:RUNNER_TEMP/windows-upgrade-fixture.exe" ./cmd/windows-upgrade-fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to build the Windows upgrade fixture.' }
+          ./scripts/test-windows-installer-startup.ps1 `
+            -InstallerPath dist/Reasonix-windows-amd64-installer.exe `
+            -ExpectedVersion $env:TEST_VERSION `
+            -FixtureBuilderPath "$env:RUNNER_TEMP/windows-upgrade-fixture.exe" `
+            -EvidenceDirectory "$env:RUNNER_TEMP/reasonix-installer-acceptance" `
+            -DisposableEnvironment
+      - name: Record Windows package identity
+        run: |
+          cp "$RUNNER_TEMP/reasonix-installer-acceptance/acceptance.json" dist/INSTALLER-ACCEPTANCE.json
+          (
+            cd dist
+            sha256sum Reasonix-windows-amd64-installer.exe > SHA256SUMS.txt
+          )
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          const name = 'Reasonix-windows-amd64-installer.exe';
+          const bytes = fs.readFileSync(`dist/${name}`);
+          fs.writeFileSync('dist/BUILD-INFO.json', JSON.stringify({
+            version: process.env.TEST_VERSION,
+            channel: 'canary',
+            platform: 'windows/amd64',
+            sourceRevision: process.env.SOURCE_SHA,
+            testingOnly: true,
+            productionSigned: false,
+            nativeAcceptance: true,
+            workflowRun: `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+            artifact: { name, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') },
+          }, null, 2) + '\n');
+          NODE
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Reasonix-v1.38.12-1-windows-x64-installer
+          path: |
+            dist/Reasonix-windows-amd64-installer.exe
+            dist/SHA256SUMS.txt
+            dist/BUILD-INFO.json
+            dist/INSTALLER-ACCEPTANCE.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  macos-universal:
+    name: Build and accept macOS Universal DMG on Apple Silicon
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify immutable source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain)"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: desktop/go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            desktop/go.sum
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          version: 10
+          run_install: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - name: Install DMG packager
+        run: brew install create-dmg
+      - name: Build ad-hoc signed macOS Universal test package
+        run: scripts/desktop-build.sh darwin/universal "$TEST_VERSION" canary
+      - name: Accept exact DMG on Apple Silicon
+        run: |
+          hdiutil verify dist/Reasonix-darwin-universal.dmg
+          mount_dir="$RUNNER_TEMP/reasonix-universal"
+          app_dir="$RUNNER_TEMP/reasonix-universal-app/Reasonix.app"
+          mkdir -p "$mount_dir" "$(dirname "$app_dir")"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_dir" dist/Reasonix-darwin-universal.dmg
+          trap 'hdiutil detach "$mount_dir"' EXIT
+          ditto "$mount_dir/Reasonix.app" "$app_dir"
+          codesign --verify --deep --strict "$app_dir"
+          node desktop/packaging/verify.mjs "$app_dir" --kind darwin-app-dir
+          node desktop/packaging/smoke.mjs "$app_dir"
+      - name: Record macOS package identity
+        run: |
+          (
+            cd dist
+            shasum -a 256 Reasonix-darwin-universal.dmg > SHA256SUMS.txt
+          )
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          const name = 'Reasonix-darwin-universal.dmg';
+          const bytes = fs.readFileSync(`dist/${name}`);
+          fs.writeFileSync('dist/BUILD-INFO.json', JSON.stringify({
+            version: process.env.TEST_VERSION,
+            channel: 'canary',
+            platform: 'darwin/universal',
+            sourceRevision: process.env.SOURCE_SHA,
+            testingOnly: true,
+            productionSigned: false,
+            nativeAcceptance: 'Apple Silicon',
+            workflowRun: `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+            artifact: { name, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') },
+          }, null, 2) + '\n');
+          NODE
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Reasonix-v1.38.12-1-macos-universal-dmg
+          path: |
+            dist/Reasonix-darwin-universal.dmg
+            dist/SHA256SUMS.txt
+            dist/BUILD-INFO.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  macos-intel-acceptance:
+    name: Accept macOS Universal DMG on Intel
+    needs: macos-universal
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          version: 10
+          run_install: false
+      - name: Install packaged smoke dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: pnpm --dir desktop install --frozen-lockfile
+      - uses: actions/download-artifact@v8
+        with:
+          name: Reasonix-v1.38.12-1-macos-universal-dmg
+          path: ${{ runner.temp }}/macos-package
+      - name: Accept exact DMG on Intel
+        run: |
+          cd "$RUNNER_TEMP/macos-package"
+          shasum -a 256 -c SHA256SUMS.txt
+          hdiutil verify Reasonix-darwin-universal.dmg
+          mount_dir="$RUNNER_TEMP/reasonix-universal"
+          app_dir="$RUNNER_TEMP/reasonix-universal-app/Reasonix.app"
+          mkdir -p "$mount_dir" "$(dirname "$app_dir")"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_dir" Reasonix-darwin-universal.dmg
+          trap 'hdiutil detach "$mount_dir"' EXIT
+          ditto "$mount_dir/Reasonix.app" "$app_dir"
+          codesign --verify --deep --strict "$app_dir"
+          node "$GITHUB_WORKSPACE/desktop/packaging/verify.mjs" "$app_dir" --kind darwin-app-dir
+          node "$GITHUB_WORKSPACE/desktop/packaging/smoke.mjs" "$app_dir"
